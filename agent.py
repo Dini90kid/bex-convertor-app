@@ -1,95 +1,297 @@
-agent.py
-import streamlit as st
+# ===============================
+# agent.py – Clean BEx GP Parser
+# ===============================
+
 from pathlib import Path
+import re
 import json
-import agent
-from utils import (zip_named_files, extract_zip_to_tmp, iter_files, build_pyspark_from_spec)
+import csv
 
-st.title("🧠 BEx conversion")
+# ---------------------------------------------------------
+# INTERNAL HELPERS
+# ---------------------------------------------------------
 
-subtask = st.selectbox("Choose BEx sub-task", [
-    "Standard (Spec + Docs + Test data)",
-    "Standard + Databricks PySpark code",
-    "Spec only", "Docs only", "Test data only"
-])
+def _read_text(path: Path) -> str:
+    """Reads text from a file with UTF‑8 fallback."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except:
+        return path.read_text(encoding="latin-1", errors="ignore")
 
-with st.expander("Advanced prompts (optional)"):
-    bex_prompts = st.text_area("Business rules / notes", height=120)
 
-mode = st.radio("Input mode", [
-    "Upload .txt file(s)",
-    "Upload ZIP of a folder",
-    "Local folder path (run locally)"
-])
+def _write_json(data, out_path: Path):
+    out_path.write_text(json(rows)    out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-files_upload = zip_upload = None
-folder_path = None
 
-if mode == "Upload .txt file(s)":
-    files_upload = st.file_uploader("Upload GP .txt", type=["txt"], accept_multiple_files=True)
-elif mode == "Upload ZIP of a folder":
-    zip_upload = st.file_uploader("Upload ZIP containing GP .txt files", type=["zip"])
-else:
-    folder_path = st.text_input("Local folder path (contains GP .txt files)", value="", placeholder=r"C:\path\to\gp_exports")
+# ---------------------------------------------------------
+# OVERRIDES LOADER
+# ---------------------------------------------------------
 
-run = st.button("🚀 Run BEx agent", type="primary")
-
-if run:
-    tmp_root = Path(st.session_state.get("tmp_bex", Path.cwd()))
-    in_dir = Path(tempfile.mkdtemp()) / "bex_in"
-    out_dir = in_dir / "_agent_output"
-    in_dir.mkdir(parents=True, exist_ok=True); out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Resolve inputs to list[Path]
-    gp_paths = []
-    if files_upload:
-        for f in files_upload: (in_dir / f.name).write_bytes(f.getvalue())
-        gp_paths = [p for p in in_dir.iterdir() if p.suffix.lower()==".txt"]
-    elif zip_upload:
-        root = extract_zip_to_tmp(zip_upload)
-        gp_paths = iter_files(root, (".txt",))
-        if not gp_paths: st.error("No .txt found in ZIP."); st.stop()
-    else:
-        if not folder_path: st.error("Provide a folder path or pick another mode."); st.stop()
-        root = Path(folder_path)
-        if not root.exists(): st.error(f"Path not found: {root}"); st.stop()
-        gp_paths = iter_files(root, (".txt",))
-        if not gp_paths: st.error("No .txt files under that folder."); st.stop()
-
-    # Run agent
-    bundle = {}; logs = []
-    overrides = agent.load_overrides(in_dir if files_upload else (root if folder_path else root))
-    for src in gp_paths:
+def load_overrides(folder: Path):
+    """Loads overrides JSON if present."""
+    ov = folder / "char_map_overrides.json"
+    if ov.exists():
         try:
-            # ensure agent writes outputs into out_dir
-            if src.parent != in_dir:
-                dst = in_dir / src.name; dst.write_bytes(src.read_bytes()); src_for_agent = dst
-            else:
-                src_for_agent = src
+            return json.loads(ov.read_text())
+        except:
+            return {}
+    return {}
 
-            agent.process_gp_file(src_for_agent, overrides, out_dir)
-            logs.append(f"✅ Processed: {src.name}")
 
-            if "Databricks PySpark code" in subtask:
-                produced = list(out_dir.glob(f"{src.stem}*_spec.json")) or list(out_dir.glob("*_spec.json"))
-                if produced:
-                    spec_json = json.loads(produced[0].read_text(encoding="utf-8"))
-                    pys = build_pyspark_from_spec(spec_json, bex_prompts or "")
-                    code_name = f"pyspark/{spec_json.get('query_name','bex_query').lower()}_spark.py"
-                    bundle[code_name] = pys.encode()
+# ---------------------------------------------------------
+# CORE PARSER
+# ---------------------------------------------------------
 
-        except Exception as e:
-            logs.append(f"⚠️ Skipped {src.name}: {e}")
+def parse_gp_text(txt: str, overrides: dict):
+    """
+    Parse a BEx generated program GP text.
+    Extract:
+      - Query metadata
+      - InfoProvider / Cube
+      - Characteristics
+      - Variables
+      - Key Figures
+      - MOVE_Z_SP logic
+    """
 
-    for f in out_dir.glob("*"): bundle[f.name] = f.read_bytes()
+    lines = txt.splitlines()
 
-    def keep(kind):
-        if kind=="Spec only": return [k for k in bundle if k.endswith("_spec.json")]
-        if kind=="Docs only": return [k for k in bundle if k.endswith("_documentation.md")]
-        if kind=="Test data only": return [k for k in bundle if k.endswith("_testdata.csv")]
-        return list(bundle.keys())
+    # -----------------------------
+    # 1) METADATA
+    # -----------------------------
+    metadata = {}
 
-    zip_bytes = zip_named_files({k: bundle[k] for k in keep(subtask)})
-    st.success("BEx run completed.")
-    st.code("\n".join(logs), language="text")
-    st.download_button("📦 Download BEx outputs (ZIP)", data=zip_bytes, file_name="bex_outputs.zip", mime="application/zip")
+    rep = re.search(r"REPORT:\s*(\S+)", txt)
+    if rep:
+        metadata["report"] = rep.group(1)
+
+    cube = re.search(r"INFOCUBE\.*:\s*(\S+)", txt)
+    if cube:
+        metadata["infocube"] = cube.group(1)
+
+    # -----------------------------
+    # 2) CHARACTERISTICS & VARIABLES
+    # -----------------------------
+
+    chars = []
+    variables = {}
+
+    # Pattern: FORM A_S_XXXX (Single/Range Vars)
+    for m in re.finditer(r"FORM\s+A_S_(\d+)", txt):
+        tech_id = m.group(1)
+        block = extract_form_block(txt, f"A_S_{tech_id}")
+        ranges = extract_ranges(block)
+        singles = extract_singles(block)
+
+        chars.append({
+            "tech_id": tech_id,
+            "infoobject": overrides.get(tech_id, f"CH_{tech_id}"),
+            "variables": {
+                "ranges": ranges,
+                "single": singles
+            }
+        })
+
+    # Pattern: FORM A_K_XXXX (Key variances)
+    for m in re.finditer(r"FORM\s+A_K_(\d+)", txt):
+        tech_id = m.group(1)
+        block = extract_form_block(txt, f"A_K_{tech_id}")
+        singles = extract_singles(block)
+        chars.append({
+            "tech_id": tech_id,
+            "infoobject": overrides.get(tech_id, f"CH_{tech_id}"),
+            "variables": {
+                "ranges": [],
+                "single": singles
+            }
+        })
+
+    # -----------------------------
+    # 3) KEY FIGURES
+    # -----------------------------
+    kf = set()
+    for line in lines:
+        if "SUM" in line or "Z____" in line:
+            m = re.findall(r"Z[_A-Z0-9]{10,}", line)
+            for x in m:
+                kf.add(x)
+
+    key_figures = sorted(kf)
+
+    # -----------------------------
+    # 4) MOVE_Z_SP transformations
+    # -----------------------------
+    move_blocks = {}
+    for m in re.finditer(r"MOVE_Z_SP_(\d+)", txt):
+        num = m.group(1)
+        move_blocks[f"MOVE_Z_SP_{num}"] = extract_form_block(txt, f"MOVE_Z_SP_{num}")
+
+    # -----------------------------
+    # FINAL SPEC
+    # -----------------------------
+    spec = {
+        "query_name": metadata.get("report", "UNKNOWN"),
+        "infocube": metadata.get("infocube", "UNKNOWN"),
+        "characteristics": chars,
+        "key_figures": key_figures,
+        "move_blocks": move_blocks
+    }
+
+    return spec
+
+
+# ---------------------------------------------------------
+# FORM BLOCK EXTRACTOR
+# ---------------------------------------------------------
+
+def extract_form_block(txt: str, form_name: str):
+    """
+    Extracts text from:
+      FORM <form_name> 
+      to
+      ENDFORM.
+    """
+    pattern = (
+        rf"FORM\s+{re.escape(form_name)}\b(.+?)ENDFORM\."
+    )
+    m = re.search(pattern, txt, flags=re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+# ---------------------------------------------------------
+# VARIABLE RANGE / SINGLE EXTRACTION
+# ---------------------------------------------------------
+
+def extract_ranges(block: str):
+    """Extract RANGES: LSxxxx HSxxxx pairs."""
+    ranges = []
+    ls = re.findall(r"LS(\d+)", block)
+    hs = re.findall(r"HS(\d+)", block)
+    # pair them safely
+    for a, b in zip(ls, hs):
+        ranges.append([f"LS{a}", f"HS{b}"])
+    return ranges
+
+
+def extract_singles(block: str):
+    """Extract single selections LKxxxx or LSxxxx."""
+    singles = []
+    for m in re.findall(r"LSK", block):
+        singles.append(f"LK{m}")
+    return singles
+
+
+# ---------------------------------------------------------
+# DOCUMENTATION GENERATOR
+# ---------------------------------------------------------
+
+def generate_markdown(spec: dict, notes: str = ""):
+    md = []
+    md.append(f"# Query: {spec.get('query_name')}")
+    md.append("")
+    md.append(f"**InfoProvider:** {spec.get('infocube')}")
+    md.append("")
+
+    md.append("## Characteristics")
+    for c in spec["characteristics"]:
+        md.append(f"- **{c['infoobject']}** (Tech ID: {c['tech_id']})")
+        md.append(f"  - Ranges: {c['variables']['ranges']}")
+        md.append(f"  - Single: {c['variables']['single']}")
+
+    md.append("")
+    md.append("## Key Figures")
+    for k in spec["key_figures"]:
+        md.append(f"- {k}")
+
+    md.append("")
+    md.append("## MOVE_Z_SP Blocks")
+    for k, block in spec["move_blocks"].items():
+        md.append(f"### {k}")
+        md.append("```")
+        md.append(block)
+        md.append("```")
+
+    if notes:
+        md.append("")
+        md.append("## Notes")
+        md.append(notes)
+
+    return "\n".join(md)
+
+
+# ---------------------------------------------------------
+# TEST DATA GENERATOR
+# ---------------------------------------------------------
+
+def generate_testdata(spec: dict):
+    """
+    Simple test-data generator:
+      - For each characteristic → sample value
+      - For each KF → dummy numeric
+    Generates 5 rows.
+    """
+    rows = []
+    headers = []
+
+    # Characteristics
+    for c in spec["characteristics"]:
+        headers.append(c["infoobject"])
+
+    # KFs
+    for k in spec["key_figures"]:
+        headers.append(k)
+
+    for i in range(5):
+        row = []
+        # values
+        for c in spec["characteristics"]:
+            row.append(f"{c['infoobject']}_{i+1}")
+        for k in spec["key_figures"]:
+            row.append(i + 1)
+        rows.append(row)
+
+    return headers, rows
+
+
+# ---------------------------------------------------------
+# MAIN ENTRY — CALLED FROM STREAMLIT
+# ---------------------------------------------------------
+
+def process_gp_file(path: Path, overrides: dict, out_dir: Path):
+    """
+    Full workflow:
+      1. Read GP file
+      2. Parse spec
+      3. Write JSON spec
+      4. Write Markdown documentation
+      5. Write test data CSV
+    """
+
+    txt = _read_text(path)
+    spec = parse_gp_text(txt, overrides)
+
+    # Write JSON
+    spec_path = out_dir / f"{path.stem}_spec.json"
+    _write_json(spec, spec_path)
+
+    # Write Markdown
+    md = generate_markdown(spec)
+    md_path = out_dir / f"{path.stem}_documentation.md"
+    _write_md(md, md_path)
+
+    # Write test data
+    headers, rows = generate_testdata(spec)
+    csv_path = out_dir / f"{path.stem}_testdata.csv"
+    _write_csv(rows, headers, csv_path)
+
+    return spec
+
+
+def _write_md(text, out_path: Path):
+    out_path.write_text(text, encoding="utf-8")
+
+
+def _write_csv(rows, headers, out_path: Path):
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
